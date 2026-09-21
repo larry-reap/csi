@@ -42,6 +42,52 @@ This is extremely useful for troubleshooting issues:
 
 ## Setup
 
+### This fork: secret handling
+
+Use Python 3.13+ and `uv sync --frozen` to install the reviewed dependency
+versions and hashes from `uv.lock`. The Session Manager plugin must be at
+least **1.2.536.0**; older versions are rejected.
+
+```bash
+export AWS_PROFILE=my-profile AWS_DEFAULT_REGION=us-east-1
+uv run --frozen csi create --name investigation \
+  --subnets subnet-example --security-groups sg-example
+uv run --frozen csi execute investigation --stdin --timeout 60 < read-only-script.sh
+uv run --frozen csi delete investigation
+```
+
+For sensitive input, pipe a script producer into `execute --stdin` rather
+than putting secrets in `-c`, shell history, or a saved script. The runner
+waits until terminal echo and shell history are disabled before sending the
+script. It runs Bash with startup files disabled. Command output (including
+remote stderr) goes to local stdout, with terminal control codes removed;
+the exit code is preserved. Output intentionally printed by a script is not
+redacted, so do not print tokens, environment contents, or raw secret responses.
+
+Session credentials go through the plugin's temporary child environment, not
+process arguments. The supported AWS plugin consumes and unsets that variable.
+This prevents ordinary command-line exposure, not inspection by the same OS
+user or root. Keep plugin diagnostic logging disabled for sensitive sessions.
+
+`execute` does not upload local AWS credentials. Interactive `ssm` also skips
+credential upload by default; `ssm --upload-credentials` explicitly enables the
+existing AWS federation flow. `genie` does not enable credential upload.
+
+Environment creation returns its ID immediately. Execution waits internally
+for readiness (up to 180 seconds), logging only state changes. `--timeout`
+controls the subsequent session/command deadline. Failed operations do not
+print request/session contents or Python tracebacks. Sessions are closed after
+execution, including failures; delete your temporary environment explicitly
+and verify AWS has removed its network interface. A failed session close is
+reported rather than silently treated as confirmed cleanup.
+
+Validation:
+
+```bash
+uv run --frozen python -m unittest discover -s tests -v
+uvx pip-audit --path .venv/lib/python3.13/site-packages --skip-editable
+```
+
 You can install `csi` via `pip` or `uv`, etc:
 
 ```bash

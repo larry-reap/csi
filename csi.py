@@ -23,11 +23,16 @@ import sys
 import json
 import time
 import subprocess
-from multiprocessing import Process
+from threading import Event, Thread
 from functools import cache
 from pathlib import Path
+from csi_session import SessionError, plugin_process, execute as execute_session
 
 DEFAULT_ENVIRONMENT = 'default'
+
+
+class SessionCleanupError(SessionError):
+    pass
 
 @cache
 def aws_client(*args, **kwargs):
@@ -86,15 +91,23 @@ def call_api(
         data = json.dumps(_json)
 
     request = botocore.awsrequest.AWSRequest(method, url, data=data, headers=headers, params=params)
-    signer = botocore.auth.SigV4Auth(boto_session.get_credentials(), service, get_region(boto_session))
+    signer = botocore.auth.SigV4Auth(boto_session.get_credentials().get_frozen_credentials(), service, get_region(boto_session))
     signer.add_auth(request)
-    response = session.request(
-        request.method, request.url, data=request.data, headers=request.headers, params=request.params, **kwargs
-    )
+    kwargs.setdefault('timeout', (5, 20))
+    kwargs.setdefault('allow_redirects', False)
+    try:
+        response = session.request(
+            request.method, request.url, data=request.data, headers=request.headers, params=request.params, **kwargs
+        )
+    except requests.RequestException:
+        raise SessionError('AWS request failed (connection or timeout)') from None
     try:
         response.raise_for_status()
-    except requests.exceptions.HTTPError as e:
-        raise Exception(f'{response.json().get("code")}: {response.json().get("message")}') from e
+    except requests.exceptions.HTTPError:
+        # Response bodies and exception chains can contain signed URLs/tokens.
+        raise SessionError(f'AWS request failed (HTTP {response.status_code})') from None
+    if response.is_redirect and kwargs['allow_redirects'] is False and method != 'GET':
+        raise SessionError('AWS returned an unexpected redirect')
     return response
 
 def get_vpc_from_subnets(subnets):
@@ -114,9 +127,9 @@ def console_login_url(session):
     if not session:
         session = boto3.Session()
 
-    creds = session.get_credentials()
+    creds = session.get_credentials().get_frozen_credentials()
     payload = json.dumps({'sessionId': creds.access_key, 'sessionKey': creds.secret_key, 'sessionToken': creds.token})
-    response = requests.get(url, params={'Action': 'getSigninToken', 'Session': payload}).json()
+    response = requests.get(url, params={'Action': 'getSigninToken', 'Session': payload}, timeout=(5, 20)).json()
 
     params = urllib.parse.urlencode({'Action': 'login', 'Destination': dest, 'SigninToken': response['SigninToken']})
     return url + '?' + params
@@ -130,13 +143,13 @@ class Cloudshell:
     # https://a.b.cdn.console.awsstatic.com/a/v1/F3XUYSJVJOSMATZ5TWLDVDGJUUCOTJW5UGHDFLODSUCMMAQRUWFA/main.js
     def _upload_credentials(self, id):
         session = requests.Session()
-        session.get(console_login_url(self.session))
+        session.get(console_login_url(self.session), timeout=(5, 20))
 
         # crypto.randomUUID() equivalent from JS
         state = str(uuid.uuid4())
         verifier = str(uuid.uuid4()) + str(uuid.uuid4())
         params = urllib.parse.urlencode({'state': state})
-        redirect_uri = 'https://auth.cloudshell.ap-southeast-2.aws.amazon.com/callback.js?' + params
+        redirect_uri = f'https://auth.cloudshell.{get_region(self.session)}.aws.amazon.com/callback.js?' + params
 
         # this code challenge flow is OAuth 2.0 PKCE https://oauth.net/2/pkce
         digest = hashlib.sha256(verifier.encode('utf-8')).digest()
@@ -175,65 +188,57 @@ class Cloudshell:
 
         self.put_credentials(EnvironmentId=id, KeyBase=keybase, RefreshToken=token)
 
-    def _execute(self, id, cmd, stdout=sys.stdout):
-        cloudshell._start_environment(id)
-        data = cloudshell.create_session(EnvironmentId=id, QCliDisabled=True)
-        with cloudshell._heart_beat(id):
-            proc = subprocess.Popen(
-                ['session-manager-plugin', json.dumps(data), get_region(), 'StartSession'],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                # stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-            )
+    @contextlib.contextmanager
+    def _command_session(self, id):
+        data = self.create_session(
+            EnvironmentId=id, QCliDisabled=True, SessionType='TMUX', TabId=str(uuid.uuid4()),
+        )
+        failed = False
+        try:
+            with self._heart_beat(id):
+                yield data
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            try:
+                self.delete_session(EnvironmentId=id, SessionId=data['SessionId'])
+            except Exception:
+                logging.error('Could not confirm remote session cleanup; delete the environment')
+                if not failed:
+                    raise SessionCleanupError('Remote session cleanup failed') from None
 
-            prompt = str(uuid.uuid4())
-            exit_marker = str(uuid.uuid4())
-            wait_for_output(proc, '$')
-            proc.stdin.write('PS1=' + prompt + '; HISTFILE=/dev/null\n')
-            proc.stdin.flush()
-            wait_for_output(proc, prompt)
-            proc.stdin.write(cmd + '\n')
-            proc.stdin.write('echo ' + exit_marker + '$?\n')
-            proc.stdin.flush()
+    def _execute(self, id, cmd, stdout=sys.stdout, timeout=120):
+        self._start_environment(id)
+        status = None
+        try:
+            with self._command_session(id) as data:
+                status = execute_session(data, get_region(self.session), cmd, stdout, timeout)
+        except SessionCleanupError:
+            if status:
+                return status
+            raise
+        return status
 
-            code = 0
-            executed = False
-            # TODO handle stderr
-            for line in iter(proc.stdout.readline, ''):
-                # ignore everything before prompt and cmd
-                if prompt in line and cmd in line:
-                    executed = True
-                elif prompt not in line:
-                    # if command is finished
-                    if exit_marker in line:
-                        code = line.strip().removeprefix(exit_marker)
-                        code = int(code)
-                        # avoid printing the Exiting session ... stuff
-                        executed = False
-                        proc.stdin.write('exit\n')
-                        proc.stdin.flush()
-                    # if command has been executed, but not completed, output all stdout in real time
-                    elif executed:
-                        stdout.write(line)
-                        stdout.flush()
-        return code
+    def _ssm(self, id, upload_credentials=False):
+        self._start_environment(id)
+        if upload_credentials:
+            self._upload_credentials(id)
+        with self._command_session(id) as data:
+            with ignore_user_entered_signals(), plugin_process(data, get_region(self.session), interactive=True) as proc:
+                if proc.wait():
+                    raise SessionError('Session Manager plugin exited unsuccessfully')
 
-    def _ssm(self, id):
-        cloudshell._start_environment(id)
-        cloudshell._upload_credentials(id)
-        data = cloudshell.create_session(EnvironmentId=id)
-        with ignore_user_entered_signals():
-            with cloudshell._heart_beat(id):
-                cmd = ['session-manager-plugin', json.dumps(data), get_region(), 'StartSession']
-                subprocess.check_call(cmd)
-
-    def _start_environment(self, id):
+    def _start_environment(self, id, timeout=180):
+        deadline = time.monotonic() + timeout
+        previous_status = None
         while True:
+            if time.monotonic() >= deadline:
+                raise SessionError('CloudShell environment startup timed out')
             data = self.get_environment_status(EnvironmentId=id)
-            logging.info('Environment is %s ...', data['Status'])
+            if data['Status'] != previous_status:
+                logging.info('Environment is %s', data['Status'])
+                previous_status = data['Status']
             if data['Status'] in {'SUSPENDED'}:
                 self.start_environment(EnvironmentId=id)
                 time.sleep(3)
@@ -242,7 +247,7 @@ class Cloudshell:
             elif data['Status'] == 'RUNNING':
                 break
             else:
-                raise NotImplementedError(data['Status'])
+                raise SessionError('Unexpected CloudShell environment status')
 
     def _create_environment(self, name=None, subnets=None, sgs=None, temporary=False):
         data = {}
@@ -252,7 +257,7 @@ class Cloudshell:
             data = {'EnvironmentName': name, 'VpcConfig': {'VpcId': vpc, 'SecurityGroupIds': sgs, 'SubnetIds': subnets}}
         env = self.create_environment(**data)
         id = env['EnvironmentId']
-        cloudshell._start_environment(id)
+        # Return the ID before waiting so callers can clean up a failed startup.
         return id
 
     @contextlib.contextmanager
@@ -269,20 +274,24 @@ class Cloudshell:
                 logging.info('Deleting temporary CloudShell environment...')
                 cloudshell.delete_environment(EnvironmentId=env)
 
-    def _send_heart_beat_loop(self, id, timeout=60):
-        while True:
-            self.send_heart_beat(EnvironmentId=id)
-            time.sleep(timeout)
+    def _send_heart_beat_loop(self, id, stopped, timeout=60):
+        while not stopped.wait(timeout):
+            try:
+                self.send_heart_beat(EnvironmentId=id)
+            except Exception:
+                logging.warning('CloudShell heartbeat failed; session may expire')
+                return
 
     @contextlib.contextmanager
     def _heart_beat(self, id):
-        proc = Process(target=self._send_heart_beat_loop, args=[id])
-        proc.start()
+        stopped = Event()
+        thread = Thread(target=self._send_heart_beat_loop, args=(id, stopped), daemon=True)
+        thread.start()
         try:
-            yield proc
+            yield
         finally:
-            if proc.is_alive():
-                proc.terminate()
+            stopped.set()
+            thread.join(timeout=25)
 
     @cache
     def _lookup_id(self, id):
@@ -410,12 +419,13 @@ class CLI:
 
     @staticmethod
     def ssm(args):
-        cloudshell._ssm(args.id)
+        cloudshell._ssm(args.id, upload_credentials=args.upload_credentials)
 
     # sort of dodgy
     @staticmethod
     def execute(args):
-        return cloudshell._execute(args.id, args.cmd, stdout=sys.stderr)
+        script = sys.stdin.read() if args.stdin else args.cmd
+        return cloudshell._execute(args.id, script, stdout=sys.stdout, timeout=args.timeout)
 
     @staticmethod
     def upload(args):
@@ -718,10 +728,14 @@ def make_main_parser():
 
     sub = subparser.add_parser('ssm', help='SSM to a CloudShell environment')
     sub.add_argument('id').complete = completer('cloudshell')
+    sub.add_argument('--upload-credentials', action='store_true', help='Explicitly forward AWS credential access to CloudShell')
 
     sub = subparser.add_parser('execute', help='Executes a command on a CloudShell environment')
     sub.add_argument('id').complete = completer('cloudshell')
-    sub.add_argument('--cmd', '-c', required=True)
+    command = sub.add_mutually_exclusive_group(required=True)
+    command.add_argument('--cmd', '-c', help='Command text; do not put secrets in arguments')
+    command.add_argument('--stdin', action='store_true', help='Read a Bash script from stdin without echoing or saving shell history')
+    sub.add_argument('--timeout', type=float, default=120, help='Session/command deadline in seconds (default: 120)')
 
     sub = subparser.add_parser('upload', help='Upload a file to a CloudShell environment')
     sub.add_argument('id').complete = completer('cloudshell')
@@ -775,6 +789,8 @@ def make_main_parser():
 def main():
     parser = make_main_parser()
     args = parser.parse_args()
+    if args.CMD == 'execute' and not (0 < args.timeout <= 3600):
+        parser.error('--timeout must be between 0 and 3600 seconds')
     if not args.CMD:
         parser.print_help()
         return
@@ -798,8 +814,19 @@ def main():
 
     return getattr(CLI, args.CMD.replace('-', '_'))(args)
 
-if __name__ == '__main__':
+def entrypoint():
     try:
-        sys.exit(main())
+        return main()
     except KeyboardInterrupt:
-        sys.exit(130)
+        return 130
+    except SessionError as error:
+        logging.error('%s', error)
+        return 1
+    except Exception as error:
+        # Never render raw subprocess/request exceptions: they may hold secrets.
+        logging.error('Operation failed (%s); sensitive error details suppressed', type(error).__name__)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(entrypoint())
